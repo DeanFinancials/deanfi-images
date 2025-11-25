@@ -1,0 +1,128 @@
+name: Sync Images to Cloudflare R2
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'articles/**'
+      - 'authors/**'
+      - 'defaults/**'
+      - 'social/**'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  sync-to-r2:
+    runs-on: ubuntu-latest
+    
+    # Prevent concurrent syncs to avoid conflicts
+    concurrency:
+      group: r2-sync
+      cancel-in-progress: false
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # Need 2 commits to detect changes
+      
+      - name: Detect changed image files
+        id: changes
+        run: |
+          # Supported image formats
+          IMAGE_EXTENSIONS="jpg|jpeg|png|webp|svg|gif"
+          
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual trigger: sync all image files
+            echo "Manual trigger - syncing all image files"
+            find articles authors defaults social -type f -regextype posix-extended -regex ".*\.(${IMAGE_EXTENSIONS})$" 2>/dev/null > changed_files.txt || true
+          else
+            # Auto trigger: only sync changed files
+            git diff --name-only HEAD^ HEAD | grep -E "^(articles|authors|defaults|social)/.*\.(${IMAGE_EXTENSIONS})$" > changed_files.txt || true
+          fi
+          
+          # Count files
+          FILE_COUNT=$(wc -l < changed_files.txt)
+          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+          
+          # Display files that will be synced
+          if [ $FILE_COUNT -gt 0 ]; then
+            echo "Images to sync to R2:"
+            cat changed_files.txt
+          else
+            echo "No image files changed in this commit"
+          fi
+      
+      - name: Setup Node.js
+        if: steps.changes.outputs.file_count > 0
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install Wrangler
+        if: steps.changes.outputs.file_count > 0
+        run: npm install -g wrangler
+      
+      - name: Upload changed images to R2
+        if: steps.changes.outputs.file_count > 0
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          echo "🚀 Starting R2 sync for ${{ steps.changes.outputs.file_count }} image(s) to bucket: $R2_BUCKET_NAME..."
+          
+          UPLOAD_COUNT=0
+          FAIL_COUNT=0
+          
+          # Function to determine content-type based on file extension
+          get_content_type() {
+            local file="$1"
+            case "${file,,}" in
+              *.jpg|*.jpeg) echo "image/jpeg" ;;
+              *.png) echo "image/png" ;;
+              *.webp) echo "image/webp" ;;
+              *.svg) echo "image/svg+xml" ;;
+              *.gif) echo "image/gif" ;;
+              *) echo "application/octet-stream" ;;
+            esac
+          }
+          
+          while IFS= read -r file; do
+            if [ -f "$file" ]; then
+              CONTENT_TYPE=$(get_content_type "$file")
+              echo "📤 Uploading: $file (Content-Type: $CONTENT_TYPE)"
+              
+              # Upload to R2 maintaining directory structure with proper content-type
+              if wrangler r2 object put "$R2_BUCKET_NAME/$file" \
+                --file="$file" \
+                --content-type="$CONTENT_TYPE" \
+                --remote; then
+                echo "✅ Successfully uploaded: $file"
+                UPLOAD_COUNT=$((UPLOAD_COUNT + 1))
+              else
+                echo "❌ Failed to upload: $file"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+              fi
+            else
+              echo "⚠️  File not found (may have been deleted): $file"
+            fi
+          done < changed_files.txt
+          
+          echo ""
+          echo "📊 Upload Summary:"
+          echo "   Total images: ${{ steps.changes.outputs.file_count }}"
+          echo "   Successful: $UPLOAD_COUNT"
+          echo "   Failed: $FAIL_COUNT"
+          
+          if [ $FAIL_COUNT -gt 0 ]; then
+            echo "⚠️  Some uploads failed - check logs above"
+            exit 1
+          else
+            echo "✅ All images synced successfully to R2!"
+          fi
+      
+      - name: No changes detected
+        if: steps.changes.outputs.file_count == 0
+        run: |
+          echo "ℹ️  No image files changed in this commit - skipping R2 sync"
